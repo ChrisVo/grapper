@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: grapper <directory>")
+        sys.exit(1)
+    directory = sys.argv[1]
+    if not os.path.isdir(directory):
+        print(f"Error: {directory} is not a directory")
+        sys.exit(1)
+    os.chdir(directory)
+
+    # Get directories to exclude from GRAPPER_EXCLUDE environment variable
+    exclude_dirs = os.getenv("GRAPPER_EXCLUDE", "").split()
+
+    # Build the find command to exclude specified directories
+    find_cmd = ["find", "."]
+    for dir in exclude_dirs:
+        find_cmd.extend(["-path", f"./{dir}", "-prune", "-o"])
+    find_cmd.extend(["-type", "f", "-print"])
+
+    # Run find to list files, excluding specified directories
+    find_proc = subprocess.Popen(find_cmd, stdout=subprocess.PIPE)
+
+    try:
+        fzf_proc = subprocess.run(
+            ["fzf", "--multi", "--preview", "cat {}", "--bind", "space:toggle"],
+            stdin=find_proc.stdout,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        print("Error: fzf is not installed")
+        sys.exit(1)
+
+    selected_files = fzf_proc.stdout.strip().split("\n")
+    if not selected_files or selected_files == [""]:
+        print("No files selected")
+        sys.exit(0)
+
+    markdown = ""
+    for file in selected_files:
+        if not os.path.isfile(file):
+            print(f"Skipping {file}: not a file")
+            continue
+        try:
+            with open(file, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            print(f"Skipping {file}: {e}")
+            continue
+        # Use file path without './' prefix for cleaner headers
+        file_display = file[2:] if file.startswith("./") else file
+        markdown += f"## {file_display}\n\n{content}\n\n"
+    markdown += "## END OF FILE\n"
+
+    # Print the markdown
+    print(markdown)
+
+    # Ask user if they want to copy to clipboard
+    copy_to_clipboard = input("Copy to clipboard? (y/n): ").strip().lower()
+    if copy_to_clipboard == "y" or copy_to_clipboard == "yes":
+        try:
+            # Detect platform and use appropriate clipboard command
+            if sys.platform == "darwin":  # macOS
+                clipboard_proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+                clipboard_proc.communicate(markdown.encode("utf-8"))
+                print("Copied to clipboard!")
+            elif sys.platform == "win32":  # Windows
+                clipboard_proc = subprocess.Popen(["clip"], stdin=subprocess.PIPE)
+                clipboard_proc.communicate(markdown.encode("utf-8"))
+                print("Copied to clipboard!")
+            elif sys.platform.startswith("linux"):  # Linux
+                # Try xclip first, then xsel
+                try:
+                    clipboard_proc = subprocess.Popen(
+                        ["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE
+                    )
+                    clipboard_proc.communicate(markdown.encode("utf-8"))
+                    print("Copied to clipboard!")
+                except FileNotFoundError:
+                    try:
+                        clipboard_proc = subprocess.Popen(
+                            ["xsel", "--clipboard", "--input"], stdin=subprocess.PIPE
+                        )
+                        clipboard_proc.communicate(markdown.encode("utf-8"))
+                        print("Copied to clipboard!")
+                    except FileNotFoundError:
+                        print(
+                            "Error: Neither xclip nor xsel is installed. Please install one of them to use clipboard functionality."
+                        )
+            else:
+                print(f"Clipboard functionality not supported on {sys.platform}")
+        except Exception as e:
+            print(f"Failed to copy to clipboard: {e}")
+
+
+if __name__ == "__main__":
+    main()
