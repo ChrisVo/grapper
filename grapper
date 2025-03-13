@@ -2,6 +2,47 @@
 import os
 import subprocess
 import sys
+import fnmatch
+
+
+def parse_gitignore(gitignore_path):
+    """Parse .gitignore file and return a list of patterns to exclude."""
+    if not os.path.isfile(gitignore_path):
+        return []
+
+    patterns = []
+    try:
+        with open(gitignore_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                # Skip empty lines and comments
+                if line and not line.startswith("#"):
+                    patterns.append(line)
+    except Exception as e:
+        print(f"Warning: Could not read .gitignore file: {e}")
+
+    return patterns
+
+
+def should_exclude(file_path, gitignore_patterns):
+    """Check if a file should be excluded based on gitignore patterns."""
+    # Convert to relative path for matching
+    rel_path = file_path
+    if rel_path.startswith("./"):
+        rel_path = rel_path[2:]
+
+    for pattern in gitignore_patterns:
+        # Handle directory patterns (ending with /)
+        if pattern.endswith("/"):
+            if fnmatch.fnmatch(rel_path + "/", "*" + pattern) or fnmatch.fnmatch(
+                rel_path + "/", pattern + "*"
+            ):
+                return True
+        # Handle file patterns
+        elif fnmatch.fnmatch(rel_path, pattern):
+            return True
+
+    return False
 
 
 def main():
@@ -17,6 +58,13 @@ def main():
     # Get directories to exclude from GRAPPER_EXCLUDE environment variable
     exclude_dirs = os.getenv("GRAPPER_EXCLUDE", "").split()
 
+    # Parse .gitignore if it exists
+    gitignore_patterns = parse_gitignore(".gitignore")
+    if gitignore_patterns:
+        print(
+            f"Excluding patterns from .gitignore ({len(gitignore_patterns)} patterns)"
+        )
+
     # Build the find command to exclude specified directories
     find_cmd = ["find", "."]
     for dir in exclude_dirs:
@@ -24,15 +72,36 @@ def main():
     find_cmd.extend(["-type", "f", "-print"])
 
     # Run find to list files, excluding specified directories
-    find_proc = subprocess.Popen(find_cmd, stdout=subprocess.PIPE)
+    find_proc = subprocess.Popen(find_cmd, stdout=subprocess.PIPE, text=True)
+
+    # Filter out files that match gitignore patterns
+    all_files = find_proc.stdout.read().strip().split("\n")
+    filtered_files = [f for f in all_files if not should_exclude(f, gitignore_patterns)]
+
+    # If no files left after filtering
+    if not filtered_files:
+        print("No files found after applying exclusions")
+        sys.exit(0)
 
     try:
-        fzf_proc = subprocess.run(
-            ["fzf", "--multi", "--preview", "cat {}", "--bind", "space:toggle"],
-            stdin=find_proc.stdout,
-            stdout=subprocess.PIPE,
-            text=True,
-        )
+        # Create a temporary file with the filtered list
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp:
+            temp.write("\n".join(filtered_files))
+            temp_filename = temp.name
+
+        # Use the temporary file as input to fzf
+        with open(temp_filename, "r") as temp:
+            fzf_proc = subprocess.run(
+                ["fzf", "--multi", "--preview", "cat {}", "--bind", "space:toggle"],
+                stdin=temp,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+
+        # Clean up the temporary file
+        os.unlink(temp_filename)
     except FileNotFoundError:
         print("Error: fzf is not installed")
         sys.exit(1)
