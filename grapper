@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import fnmatch
+import tempfile
 
 
 def parse_gitignore(gitignore_path):
@@ -15,83 +16,136 @@ def parse_gitignore(gitignore_path):
         with open(gitignore_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                # Skip empty lines and comments
                 if line and not line.startswith("#"):
                     patterns.append(line)
     except Exception as e:
         print(f"Warning: Could not read .gitignore file: {e}")
-
     return patterns
 
 
 def should_exclude(file_path, gitignore_patterns):
     """Check if a file should be excluded based on gitignore patterns."""
-    # Convert to relative path for matching
     rel_path = file_path
     if rel_path.startswith("./"):
         rel_path = rel_path[2:]
+    basename = os.path.basename(rel_path)
 
     for pattern in gitignore_patterns:
-        # Handle directory patterns (ending with /)
-        if pattern.endswith("/"):
-            if fnmatch.fnmatch(rel_path + "/", "*" + pattern) or fnmatch.fnmatch(
-                rel_path + "/", pattern + "*"
-            ):
-                return True
-        # Handle file patterns
-        elif fnmatch.fnmatch(rel_path, pattern):
-            return True
+        if pattern.startswith("/"):
+            # Anchored pattern
+            pattern = pattern[1:]  # Remove leading '/'
+            if pattern.endswith("/"):
+                # Directory pattern
+                pattern = pattern.rstrip("/")
+                pattern_with_slashes = "/" + pattern + "/"
+                rel_path_with_slashes = "/" + rel_path + "/"
+                if pattern_with_slashes in rel_path_with_slashes:
+                    return True
+            elif "*" not in pattern and "?" not in pattern and "[" not in pattern:
+                # No wildcards: treat as directory
+                pattern_with_slashes = "/" + pattern + "/"
+                rel_path_with_slashes = "/" + rel_path + "/"
+                if pattern_with_slashes in rel_path_with_slashes:
+                    return True
+            else:
+                # With wildcards: use fnmatch
+                if fnmatch.fnmatch(rel_path, pattern):
+                    return True
+        else:
+            if pattern.endswith("/"):
+                dir_pattern = pattern.rstrip("/")
+                if rel_path.startswith(dir_pattern + "/") or rel_path == dir_pattern:
+                    return True
+            elif "/" in pattern:
+                if fnmatch.fnmatch(rel_path, pattern):
+                    return True
+            else:
+                # First check basename match
+                if fnmatch.fnmatch(basename, pattern):
+                    return True
 
+                # Then check if it's a potential directory pattern (no wildcards)
+                if "*" not in pattern and "?" not in pattern and "[" not in pattern:
+                    pattern_with_slashes = "/" + pattern + "/"
+                    rel_path_with_slashes = "/" + rel_path + "/"
+                    if (
+                        pattern_with_slashes in rel_path_with_slashes
+                        or rel_path.startswith(pattern + "/")
+                    ):
+                        return True
     return False
 
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: grapper <directory>")
+    if len(sys.argv) < 2:
+        print("Usage: grapper <directory> [--validate]")
         sys.exit(1)
+
     directory = sys.argv[1]
+    validate_only = "--validate" in sys.argv
+
     if not os.path.isdir(directory):
         print(f"Error: {directory} is not a directory")
         sys.exit(1)
     os.chdir(directory)
 
-    # Get directories to exclude from GRAPPER_EXCLUDE environment variable
-    exclude_dirs = os.getenv("GRAPPER_EXCLUDE", "").split()
-
-    # Parse .gitignore if it exists
+    # Get user-specified exclusions and add .git by default
+    exclude_dirs = [".git"] + os.getenv("GRAPPER_EXCLUDE", "").split()
     gitignore_patterns = parse_gitignore(".gitignore")
-    if gitignore_patterns:
-        print(
-            f"Excluding patterns from .gitignore ({len(gitignore_patterns)} patterns)"
-        )
+    if gitignore_patterns and validate_only:
+        print(f"\nGitignore patterns ({len(gitignore_patterns)}):")
+        for pattern in gitignore_patterns:
+            print(f"  - {pattern}")
 
-    # Build the find command to exclude specified directories
-    find_cmd = ["find", "."]
-    for dir in exclude_dirs:
-        find_cmd.extend(["-path", f"./{dir}", "-prune", "-o"])
-    find_cmd.extend(["-type", "f", "-print"])
-
-    # Run find to list files, excluding specified directories
+    find_cmd = ["find", ".", "-type", "f"]
     find_proc = subprocess.Popen(find_cmd, stdout=subprocess.PIPE, text=True)
-
-    # Filter out files that match gitignore patterns
     all_files = find_proc.stdout.read().strip().split("\n")
-    filtered_files = [f for f in all_files if not should_exclude(f, gitignore_patterns)]
 
-    # If no files left after filtering
+    # Group files by their exclusion status and pattern
+    excluded_files = {}
+    included_files = []
+
+    for f in all_files:
+        if f.startswith("./"):
+            f = f[2:]
+        is_excluded = should_exclude(f, gitignore_patterns)
+        if is_excluded:
+            # Find which pattern caused the exclusion
+            for pattern in gitignore_patterns:
+                if should_exclude(f, [pattern]):
+                    excluded_files.setdefault(pattern, []).append(f)
+                    break
+        else:
+            included_files.append(f)
+
+    if validate_only:
+        # Print validation summary
+        print("\nValidation Summary:")
+        print("------------------")
+
+        print("\nExcluded files by pattern:")
+        for pattern, files in excluded_files.items():
+            print(f"\n  Pattern: {pattern}")
+            for f in sorted(files):
+                print(f"    - {f}")
+
+        print("\nIncluded files:")
+        for f in sorted(included_files):
+            print(f"  - {f}")
+        sys.exit(0)
+
+    # Only include non-excluded files
+    filtered_files = included_files
+
     if not filtered_files:
         print("No files found after applying exclusions")
         sys.exit(0)
 
     try:
-        # Create a temporary file with the filtered list
-        import tempfile
-
         with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp:
             temp.write("\n".join(filtered_files))
             temp_filename = temp.name
 
-        # Use the temporary file as input to fzf
         with open(temp_filename, "r") as temp:
             fzf_proc = subprocess.run(
                 ["fzf", "--multi", "--preview", "cat {}", "--bind", "space:toggle"],
@@ -99,8 +153,6 @@ def main():
                 stdout=subprocess.PIPE,
                 text=True,
             )
-
-        # Clean up the temporary file
         os.unlink(temp_filename)
     except FileNotFoundError:
         print("Error: fzf is not installed")
@@ -122,46 +174,37 @@ def main():
         except Exception as e:
             print(f"Skipping {file}: {e}")
             continue
-        # Use file path without './' prefix for cleaner headers
         file_display = file[2:] if file.startswith("./") else file
         markdown += f"## {file_display}\n\n{content}\n\n"
     markdown += "## END OF FILE\n"
 
-    # Print the markdown
     print(markdown)
 
-    # Ask user if they want to copy to clipboard
     copy_to_clipboard = input("Copy to clipboard? (y/n): ").strip().lower()
     if copy_to_clipboard == "y" or copy_to_clipboard == "yes":
         try:
-            # Detect platform and use appropriate clipboard command
-            if sys.platform == "darwin":  # macOS
-                clipboard_proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-                clipboard_proc.communicate(markdown.encode("utf-8"))
+            if sys.platform == "darwin":
+                subprocess.run(["pbcopy"], input=markdown, text=True)
                 print("Copied to clipboard!")
-            elif sys.platform == "win32":  # Windows
-                clipboard_proc = subprocess.Popen(["clip"], stdin=subprocess.PIPE)
-                clipboard_proc.communicate(markdown.encode("utf-8"))
+            elif sys.platform == "win32":
+                subprocess.run(["clip"], input=markdown, text=True)
                 print("Copied to clipboard!")
-            elif sys.platform.startswith("linux"):  # Linux
-                # Try xclip first, then xsel
+            elif sys.platform.startswith("linux"):
                 try:
-                    clipboard_proc = subprocess.Popen(
-                        ["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE
+                    subprocess.run(
+                        ["xclip", "-selection", "clipboard"], input=markdown, text=True
                     )
-                    clipboard_proc.communicate(markdown.encode("utf-8"))
                     print("Copied to clipboard!")
                 except FileNotFoundError:
                     try:
-                        clipboard_proc = subprocess.Popen(
-                            ["xsel", "--clipboard", "--input"], stdin=subprocess.PIPE
+                        subprocess.run(
+                            ["xsel", "--clipboard", "--input"],
+                            input=markdown,
+                            text=True,
                         )
-                        clipboard_proc.communicate(markdown.encode("utf-8"))
                         print("Copied to clipboard!")
                     except FileNotFoundError:
-                        print(
-                            "Error: Neither xclip nor xsel is installed. Please install one of them to use clipboard functionality."
-                        )
+                        print("Error: Neither xclip nor xsel is installed.")
             else:
                 print(f"Clipboard functionality not supported on {sys.platform}")
         except Exception as e:
